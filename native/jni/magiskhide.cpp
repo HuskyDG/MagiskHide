@@ -84,43 +84,53 @@ static void kill_usap_zygote() {
 }
  
 static void update_uid_map() {
-    const char *APP_DATA = "/data/user_de/0";
+    const char *APP_DATA = "/data/user_de";
     DIR *dirfp = opendir(APP_DATA);
     if (dirfp == nullptr) {
-        APP_DATA = "/data/data";
+        APP_DATA = "/data/user";
         dirfp = opendir(APP_DATA);
     }
     if (dirfp == nullptr)
         return;
     LOGI("hide: rescanning apps\n");
-    struct dirent *dp;
+    struct dirent *_data *dp;
     struct stat st;
     char buf[4098];
-    while ((dp = readdir(dirfp)) != nullptr) {
-        snprintf(buf, sizeof(buf) - 1, "%s/%s", APP_DATA, dp->d_name);
-        if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0 ||
+    // for each user
+    while ((_data = readdir(dirfp)) != nullptr) {
+        snprintf(buf, sizeof(buf) - 1, "%s/%s", APP_DATA, _data->d_name);
+        if (strcmp(_data->d_name, ".") == 0 || strcmp(_data->d_name, "..") == 0 ||
             stat(buf, &st) != 0 || !S_ISDIR(st.st_mode))
             continue;
-
-        auto it = uid_proc_map.find(st.st_uid);
-        if (it == uid_proc_map.end()) {
-            std::vector<std::string> init;
-            init.emplace_back(std::string(dp->d_name));
-            uid_proc_map[st.st_uid] = init;
-            LOGV("proc_monitor: add map uid=[%d] [%s]\n", st.st_uid, dp->d_name);
-        } else {
-            bool found = false;
-            for (int i = 0; i < it->second.size(); i++) {
-                if (it->second[i] == std::string(dp->d_name)) {
-                    found = true;
-                    break;
+        DIR *dirfp2 = opendir(APP_DATA);
+        if (dirfp2 == nullptr) continue;
+        // for each package
+        while ((dp = readdir(dirfp)) != nullptr) {
+            snprintf(buf, sizeof(buf) - 1, "%s/%s/%s", APP_DATA, _data->d_name, dp->d_name);
+            if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0 ||
+                stat(buf, &st) != 0 || !S_ISDIR(st.st_mode))
+                continue;
+            auto it = uid_proc_map.find(st.st_uid % 100000);
+            if (it == uid_proc_map.end()) {
+                std::vector<std::string> init;
+                init.emplace_back(std::string(dp->d_name));
+                uid_proc_map[st.st_uid] = init;
+                LOGV("proc_monitor: add map uid=[%d] [%s]\n", st.st_uid % 100000, dp->d_name);
+            } else {
+                bool found = false;
+                for (int i = 0; i < it->second.size(); i++) {
+                    if (it->second[i] == std::string(dp->d_name)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) { 
+                    it->second.emplace_back(std::string(dp->d_name));
+                    LOGV("proc_monitor: update map uid=[%d] [%s]\n", st.st_uid % 100000, dp->d_name);
                 }
             }
-            if (!found) { 
-                it->second.emplace_back(std::string(dp->d_name));
-                LOGV("proc_monitor: update map uid=[%d] [%s]\n", st.st_uid, dp->d_name);
-            }
         }
+        closedir(dirfp2);
     }
     closedir(dirfp);    
 }
@@ -264,6 +274,22 @@ static void setup_inotify() {
     // Monitor packages.xml
     inotify_add_watch(inotify_fd, "/data/system", IN_CLOSE_WRITE);
 
+    // Monitor app installation
+    inotify_add_watch(inotify_fd, APP_DATA_DIR, IN_CREATE);
+    DIR *dirfp = opendir(APP_DATA_DIR);
+    if (dirfp) {
+   	    char buf[4098];
+        struct dirent *dp;
+        while ((dp = readdir(dirfp)) != nullptr) {
+            ssprintf(buf, sizeof(buf) - 1, "%s/%s", APP_DATA_DIR, dp->d_name);
+            if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0)
+                continue;
+            LOGD("proc_monitor: monitor userspace ID=[%s]\n", dp->d_name);
+            inotify_add_watch(inotify_fd, buf, IN_ATTRIB);
+        }
+        closedir(dirfp);
+    }
+
     // Monitor app_process
     if (access(APP_PROC "32", F_OK) == 0) {
         inotify_add_watch(inotify_fd, APP_PROC "32", IN_ACCESS);
@@ -291,6 +317,12 @@ static void inotify_event(int) {
     char buf[512];
     auto event = reinterpret_cast<struct inotify_event *>(buf);
     read(inotify_fd, buf, sizeof(buf));
+    if (event->mask & IN_CREATE) {
+        std::string path = std::string(APP_DATA_DIR) + "/" + event->name;
+        LOGD("proc_monitor: monitor userspace ID=[%s]\n", event->name);
+        inotify_add_watch(inotify_fd, path.data(), IN_ATTRIB);
+        return;
+    }
     if ((event->mask & IN_CLOSE_WRITE) && strcmp(event->name, "packages.xml") == 0)
         new_daemon_thread(&update_uid_map);
     check_zygote();
